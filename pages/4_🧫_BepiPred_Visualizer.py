@@ -1,296 +1,474 @@
 # pages/4_🧫_BepiPred_Visualizer.py
-import json
-from pathlib import Path
+from __future__ import annotations
 
+from pathlib import Path
+import re
 import numpy as np
 import pandas as pd
 import streamlit as st
+import py3Dmol
+import streamlit.components.v1 as components
 import altair as alt
+import shlex
 
-# ---------------- Altair setup ----------------
+# ---- Altair config -----------------------------------------------------------
 alt.data_transformers.disable_max_rows()
 alt.themes.enable("opaque")
 
-# ---------------- Helpers ----------------
-def first_key(d: dict, candidates: list[str]) -> str | None:
-    """Return the first key in candidates that exists in dict d (case-insensitive)."""
-    kl = {k.lower(): k for k in d.keys()}
-    for c in candidates:
-        if c.lower() in kl:
-            return kl[c.lower()]
+# ---- Paths -------------------------------------------------------------------
+DATA_DIR = Path("data")
+TABLE_DIR = DATA_DIR / "tables"
+STRUCT_DIR = DATA_DIR / "structures"
+CSV_PATH = TABLE_DIR / "epitopes_iedb.csv"
+
+# ---- Small string helpers ----------------------------------------------------
+def _norm_token(s: str) -> str:
+    """lowercase + only [a-z0-9] for matching names."""
+    return re.sub(r"[^a-z0-9]", "", str(s).lower())
+
+def _norm_series_tokens(s: pd.Series) -> pd.Series:
+    """Vectorized normalization for Series."""
+    return s.astype(str).str.lower().str.replace(r"[^a-z0-9]", "", regex=True)
+
+def _name_aliases(protein: str) -> list[str]:
+    """Flexible aliases (case-insensitive, remove underscores, Sericina→Sericin)."""
+    p = str(protein).strip()
+    aliases = {p, p.lower(), p.upper(), p.capitalize(), p.replace("_", "")}
+    m = re.match(r"^sericina[_\s-]?(\d+)$", p, flags=re.IGNORECASE)
+    if m:
+        num = m.group(1)
+        aliases.add(f"Sericin{num}")
+        aliases.add(f"sericin{num}")
+    if re.match(r"^sericina$", p, flags=re.IGNORECASE):
+        aliases.add("Sericin")
+        aliases.add("sericin")
+    aliases |= {a.replace("_", "") for a in aliases}
+    # preserve order
+    return list(dict.fromkeys(aliases))
+
+# ---- Find structure file -----------------------------------------------------
+def find_structure_for(protein: str) -> Path | None:
+    if not STRUCT_DIR.exists():
+        return None
+    all_files = (
+        list(STRUCT_DIR.glob("*.cif")) + list(STRUCT_DIR.glob("*.mmcif")) + list(STRUCT_DIR.glob("*.pdb")) +
+        list(STRUCT_DIR.glob("*/*.cif")) + list(STRUCT_DIR.glob("*/*.mmcif")) + list(STRUCT_DIR.glob("*/*.pdb"))
+    )
+    if not all_files:
+        return None
+
+    aliases = _name_aliases(protein)
+    aliases_norm = {_norm_token(a) for a in aliases}
+
+    exact, partial = [], []
+    for p in all_files:
+        stem_norm = _norm_token(p.stem)
+        if stem_norm in aliases_norm:
+            exact.append(p)
+        elif any(stem_norm in _norm_token(a) or _norm_token(a) in stem_norm for a in aliases):
+            partial.append(p)
+
+    candidates = exact if exact else partial
+    if not candidates:
+        return None
+
+    def _rank(q: Path) -> tuple[int, int]:
+        sfx = q.suffix.lower()
+        if sfx in (".cif", ".mmcif"): return (0, len(q.name))
+        if sfx == ".pdb": return (1, len(q.name))
+        return (2, len(q.name))
+
+    return sorted(set(candidates), key=_rank)[0]
+
+def _compact_ranges(indices: list[int]) -> str:
+    """[1,2,3,7,10,11] -> '1-3,7,10-11' (py3Dmol 'resi' selector)."""
+    if not indices:
+        return ""
+    xs = sorted(set(int(x) for x in indices))
+    start = prev = xs[0]
+    out = []
+    for x in xs[1:]:
+        if x == prev + 1:
+            prev = x
+        else:
+            out.append((start, prev))
+            start = prev = x
+    out.append((start, prev))
+    return ",".join([f"{a}-{b}" if a != b else f"{a}" for a, b in out])
+
+# ---- mmCIF / PDB residue-map helpers (robust) --------------------------------
+def _parse_cif_atom_site(text: str):
+    """Extract (chain, label_seq_id[int], auth_seq_id[int]) from _atom_site loop. Tolerant to wrapped rows."""
+    try:
+        lines = text.splitlines()
+        rows, cols = [], []
+        in_loop = False
+        for i, ln in enumerate(lines):
+            s = ln.strip()
+            if s.lower() == "loop_":
+                in_loop = True
+                cols = []
+                continue
+            if in_loop and s.startswith("_"):
+                cols.append(s)
+                continue
+            if in_loop:
+                # is this an atom_site loop?
+                if not cols or not any(c.startswith("_atom_site.") for c in cols):
+                    in_loop = False
+                    continue
+                try:
+                    idx_label = [j for j, c in enumerate(cols) if c.endswith("label_seq_id")][0]
+                    idx_auth  = [j for j, c in enumerate(cols) if c.endswith("auth_seq_id")][0]
+                    idx_chain = [j for j, c in enumerate(cols) if c.endswith("auth_asym_id")][0]
+                except IndexError:
+                    in_loop = False
+                    continue
+
+                j = i
+                while j < len(lines):
+                    l = lines[j].strip()
+                    if not l or l.startswith("_") or l.lower() == "loop_" or l.lower().startswith("data_"):
+                        in_loop = False
+                        break
+                    toks = shlex.split(l)
+                    k = 1
+                    while len(toks) < len(cols) and (j + k) < len(lines):
+                        toks.extend(shlex.split(lines[j + k].strip()))
+                        k += 1
+                    if len(toks) >= max(idx_label, idx_auth, idx_chain) + 1:
+                        try:
+                            lab = int(toks[idx_label])
+                            aut = int(toks[idx_auth])
+                            ch  = toks[idx_chain]
+                            rows.append((ch, lab, aut))
+                        except Exception:
+                            pass
+                    j += k
+        return rows
+    except Exception:
+        return []
+
+def _parse_pdb_atoms(text: str):
+    """PDB simple: returns list (chain, label_order, resSeq)."""
+    rows = []
+    for ln in text.splitlines():
+        if ln.startswith("ATOM"):
+            chain = ln[21:22].strip() or "A"
+            try:
+                resi = int(ln[22:26])
+            except ValueError:
+                continue
+            rows.append((chain, resi))
+    # build order 1..N per chain
+    from collections import OrderedDict
+    out = []
+    per_chain = {}
+    for ch, resi in rows:
+        per_chain.setdefault(ch, OrderedDict())
+        per_chain[ch][resi] = None
+    for ch, od in per_chain.items():
+        order = 1
+        for resi in od.keys():
+            out.append((ch, order, resi))
+            order += 1
+    return out
+
+def _build_label_to_auth_maps(path: Path):
+    """Return dict: chain -> {label_seq_id -> auth_seq_id}; for PDB uses order 1..N -> resSeq."""
+    try:
+        text = path.read_text(errors="ignore")
+    except Exception:
+        return {}
+    try:
+        if path.suffix.lower() in (".cif", ".mmcif"):
+            rows = _parse_cif_atom_site(text)
+        else:
+            rows = _parse_pdb_atoms(text)
+        from collections import OrderedDict
+        chains = {}
+        if path.suffix.lower() in (".cif", ".mmcif"):
+            for ch, lab, aut in rows:
+                d = chains.setdefault(ch, OrderedDict())
+                if lab not in d:
+                    d[lab] = aut
+        else:
+            for ch, lab, aut in rows:
+                d = chains.setdefault(ch, OrderedDict())
+                if lab not in d:
+                    d[lab] = aut
+        return {ch: dict(od) for ch, od in chains.items()}
+    except Exception:
+        return {}
+
+def _color_with_label_to_auth(view, path: Path, highlight_positions: list[int], base_color="#87aade"):
+    """Robust coloring: try label->auth mapping; if it fails, fall back to simple 'resi' selection."""
+    # base style always
+    view.setStyle({"cartoon": {"color": base_color}})
+    try:
+        maps = _build_label_to_auth_maps(path)  # chain -> {label: auth}
+        if not maps:
+            # Fallback simple coloring (may be off if numbering differs)
+            sel = _compact_ranges(highlight_positions)
+            if sel:
+                view.setStyle({"resi": sel}, {"cartoon": {"color": "purple"}})
+            return
+
+        # choose the longest chain (likely main chain)
+        chain_lengths = {ch: len(m) for ch, m in maps.items()}
+        if not chain_lengths:
+            return
+        main_chain = max(chain_lengths, key=chain_lengths.get)
+        m = maps[main_chain]
+
+        auth_hits = sorted({m[p] for p in highlight_positions if p in m})
+        sel = _compact_ranges(auth_hits)
+        if sel:
+            view.setStyle({"chain": main_chain, "resi": sel}, {"cartoon": {"color": "purple"}})
+
+        missing = [p for p in highlight_positions if p not in m]
+        if missing:
+            st.caption(f"Note: {len(missing)} residues are not present in coordinates (disordered/trimmed).")
+    except Exception as e:
+        # Never block visualization
+        st.warning(f"Epitope coloring fell back to simple mode: {e}")
+        sel = _compact_ranges(highlight_positions)
+        if sel:
+            view.setStyle({"resi": sel}, {"cartoon": {"color": "purple"}})
+
+# ---- CSV loader (supports span / residue schemas) ----------------------------
+def _normalize_headers(cols: list[str]) -> list[str]:
+    out = []
+    for c in cols:
+        c2 = str(c).strip().lower().replace(" ", "").replace("-", "").replace("_", "")
+        c2 = (c2.replace("ó","o").replace("á","a").replace("é","e").replace("í","i").replace("ú","u"))
+        out.append(c2)
+    return out
+
+def _pick_column(norm_cols: list[str], candidates: set[str]) -> int | None:
+    for i, nc in enumerate(norm_cols):
+        if nc in candidates:
+            return i
+    for i, nc in enumerate(norm_cols):
+        if any(nc.startswith(c) or nc.endswith(c) for c in candidates):
+            return i
     return None
 
-def _to_list_like(x, N: int | None = None, fill=""):
-    """
-    Normalize a field to a list:
-      - list -> return as-is
-      - str  -> list of non-space characters
-      - else -> list of length N filled with `fill` (if N provided)
-    """
-    if isinstance(x, list):
-        return x
-    if isinstance(x, str):
-        s = "".join(ch for ch in x if not ch.isspace())
-        return list(s)
-    if N is not None:
-        return [fill] * N
-    return []
-
-def load_bepipred_json(path: str | Path) -> dict:
-    with open(path, "r") as fh:
-        return json.load(fh)
-
-def antigen_records(payload: dict) -> dict:
-    """Support {'antigens': {...}} or a flat dict of antigens."""
-    if isinstance(payload, dict) and isinstance(payload.get("antigens"), dict):
-        return payload["antigens"]
-    return payload
-
-def to_dataframe(name: str, rec: dict) -> pd.DataFrame:
-    """
-    Build tidy DF robust to key names & string-encoded tracks.
-    Keys candidates:
-      AA:   AA/aa/sequence/Sequence
-      PRED: PRED/pred/score/scores/bepipred/BepiPred
-      EXP:  EXPOSED/Exposure/exposed/Surface/surface
-      RSA:  RSA/rsa/ASA/asa
-    """
-    k_aa   = first_key(rec, ["AA", "aa", "sequence", "Sequence"])
-    k_pred = first_key(rec, ["PRED", "pred", "score", "scores", "bepipred", "BepiPred"])
-    if not (k_aa and k_pred):
-        raise ValueError(f"Antigen '{name}' missing AA or PRED arrays.")
-
-    aa   = _to_list_like(rec[k_aa])
-    pred = _to_list_like(rec[k_pred])
-    N = len(aa)
-    if len(pred) != N:
-        raise ValueError(f"'{name}': AA ({N}) and PRED ({len(pred)}) length mismatch.")
-
-    k_exp = first_key(rec, ["EXPOSED", "Exposure", "exposed", "Surface", "surface"])
-    k_rsa = first_key(rec, ["RSA", "rsa", "ASA", "asa"])
-
-    exp = _to_list_like(rec.get(k_exp, []), N=N, fill="")
-    rsa = rec.get(k_rsa, [np.nan]*N)
-    rsa = _to_list_like(rsa, N=N, fill=np.nan)
-
-    df = pd.DataFrame({
-        "pos": np.arange(1, N+1, dtype=int),
-        "aa": aa,
-        "pred": pd.to_numeric(pd.Series(pred), errors="coerce"),
-        "exp": exp,
-        "rsa": pd.to_numeric(pd.Series(rsa), errors="coerce")
-    })
-    # pos2 for per-residue bars (x2 must NOT carry a type in Altair v5)
-    df["pos2"] = df["pos"] + 1
-
-    # Normalize RSA to 0..1 if it looks like 0..100
-    if df["rsa"].notna().any():
-        mx = df["rsa"].max(skipna=True)
-        if pd.notna(mx) and mx > 1.5:
-            df["rsa"] = df["rsa"] / 100.0
-
-    # Exposure labels
-    exp_map = {"E": "Exposed", "B": "Buried"}
-    df["exp_label"] = df["exp"].map(exp_map).fillna("Unknown")
-
-    return df
-
-def contiguous_segments(mask: pd.Series) -> pd.DataFrame:
-    """Return 1-based start/end for contiguous True runs."""
-    arr = mask.values.astype(int)
-    edges = np.diff(np.r_[0, arr, 0])
-    starts = np.where(edges == 1)[0] + 1
-    ends   = np.where(edges == -1)[0]
-    return pd.DataFrame({"start": starts, "end": ends})
-
-# ---------------- UI ----------------
-st.title("BepiPred-2.0: Sequential B-Cell Epitope Predictor.")
-
-# Intro (solo la primera línea que querías conservar)
-st.markdown(
-    """
-**Prediction of potential linear B-cell epitopes.**
-    """
-)
-
-json_path = Path("data/tables/results.json")
-if not json_path.exists():
-    st.error(f"JSON file not found at `{json_path}`.")
-    st.stop()
-
-payload = load_bepipred_json(json_path)
-antigens = antigen_records(payload)
-names = list(antigens.keys())
-if not names:
-    st.error("No antigens found in the JSON.")
-    st.stop()
-
-left, right = st.columns([1, 2])
-with left:
-    name = st.selectbox("Antigen", names, index=0)
-with right:
-    thr = st.slider("Epitope threshold (BepiPred score)", 0.0, 1.0, 0.5, 0.01)
-
-rec = antigens[name]
-try:
-    df = to_dataframe(name, rec)
-except Exception as e:
-    st.exception(e)
-    st.stop()
-
-df["above"] = (df["pred"] >= thr)
-segments = contiguous_segments(df["above"])
-
-# ---------------- Main chart ----------------
-base = alt.Chart(df).properties(width=1050, height=260)
-
-area = base.mark_area(opacity=0.18, color="#4C78A8").encode(
-    x="pos:Q",
-    y=alt.Y("pred:Q", scale=alt.Scale(domain=[0,1]), title="BepiPred score"),
-)
-
-line = base.mark_line(strokeWidth=2, color="#305E96").encode(
-    x=alt.X("pos:Q", title="Position"),
-    y="pred:Q",
-    tooltip=[
-        alt.Tooltip("pos:Q", title="Position"),
-        alt.Tooltip("aa:N", title="AA"),
-        alt.Tooltip("pred:Q", title="Score", format=".3f"),
-        alt.Tooltip("exp_label:N", title="Exposure"),
-        alt.Tooltip("rsa:Q", title="RSA", format=".2f"),
-    ],
-)
-
-thr_rule = alt.Chart(pd.DataFrame({"thr":[thr]})).mark_rule(
-    strokeDash=[6,4], color="#333"
-).encode(y="thr:Q")
-
-if len(segments):
-    seg_chart = alt.Chart(segments).mark_rect(
-        opacity=0.25, color="#FFB000"
-    ).encode(
-        x=alt.X("start", title=None),
-        x2="end",
-        y=alt.value(0), y2=alt.value(1)
-    ).properties(height=260)
-    top = seg_chart + area + line + thr_rule
-else:
-    top = area + line + thr_rule
-
-st.subheader(f"{name} — BepiPred scores")
-st.altair_chart(top, use_container_width=True)
-
-# ---------------- Sequence tracks (Exposure + RSA) ----------------
-st.subheader("Sequence tracks")
-
-# Exposure track
-exp_colors = alt.Scale(
-    domain=["Exposed", "Buried", "Unknown"],
-    range=["#6DBD45", "#9E77B0", "#E0E0E0"]
-)
-exp_track = alt.Chart(df).mark_rect(height=14).encode(
-    x=alt.X("pos:Q", title=None),
-    x2="pos2",  # Altair v5: x2 must be plain field
-    color=alt.Color("exp_label:N", scale=exp_colors, legend=alt.Legend(title="Exposure")),
-    tooltip=[
-        alt.Tooltip("pos:Q", title="Position"),
-        alt.Tooltip("aa:N", title="AA"),
-        alt.Tooltip("exp_label:N", title="Exposure")
-    ]
-).properties(height=34, width=1050)
-
-# RSA (line + area)
-rsa_base = alt.Chart(df).properties(width=1050, height=140)
-rsa_area = rsa_base.mark_area(opacity=0.2, color="#4C78A8").encode(
-    x=alt.X("pos:Q", title="pos"),
-    y=alt.Y("rsa:Q", title="RSA", scale=alt.Scale(domain=[0,1]))
-)
-rsa_line = rsa_base.mark_line(strokeWidth=2, color="#305E96").encode(
-    x="pos:Q", y="rsa:Q",
-    tooltip=[alt.Tooltip("pos:Q"), alt.Tooltip("aa:N"), alt.Tooltip("rsa:Q", format=".2f")]
-)
-
-tracks = alt.vconcat(exp_track, (rsa_area + rsa_line)).resolve_scale(color="independent")
-st.altair_chart(tracks, use_container_width=True)
-
-# ---------------- Data table with dynamic filters ----------------
-st.subheader("Data table")
-
-with st.expander("Filters", expanded=True):
-    c1, c2, c3 = st.columns(3)
-    with c1:
-        pos_min, pos_max = int(df["pos"].min()), int(df["pos"].max())
-        pos_range = st.slider("Position range", pos_min, pos_max, (pos_min, pos_max))
-        only_above = st.checkbox("Only residues above threshold", value=False)
-    with c2:
-        score_min, score_max = float(df["pred"].min()), float(df["pred"].max())
-        score_range = st.slider("Score range", 0.0, 1.0, (max(0.0, score_min), min(1.0, score_max)), 0.01)
-        exp_opts = st.multiselect("Exposure", options=sorted(df["exp_label"].unique()),
-                                  default=list(sorted(df["exp_label"].unique())))
-    with c3:
-        rsa_present = df["rsa"].notna().any()
-        if rsa_present:
-            rsa_min = float(np.nanmin(df["rsa"]))
-            rsa_max = float(np.nanmax(df["rsa"]))
-            rsa_range = st.slider("RSA range", 0.0, 1.0, (max(0.0, rsa_min), min(1.0, rsa_max)), 0.01)
-        else:
-            rsa_range = None
-        motif = st.text_input("AA motif (regex)", value="")
-
-# Apply filters
-mask = (
-    (df["pos"] >= pos_range[0]) &
-    (df["pos"] <= pos_range[1]) &
-    (df["pred"] >= score_range[0]) &
-    (df["pred"] <= score_range[1]) &
-    (df["exp_label"].isin(exp_opts))
-)
-if only_above:
-    mask &= df["above"]
-
-if rsa_range is not None:
-    mask &= df["rsa"].between(rsa_range[0], rsa_range[1]) | df["rsa"].isna()
-
-if motif.strip():
+def load_epitopes_csv(csv_path: Path) -> tuple[str, pd.DataFrame]:
+    if not csv_path.exists():
+        st.error(f"CSV not found: `{csv_path}`"); st.stop()
     try:
-        mask &= df["aa"].str.contains(motif, regex=True, na=False)
+        df = pd.read_csv(csv_path, sep=None, engine="python")
     except Exception:
-        st.warning("Invalid regex in 'AA motif'. Showing unfiltered AA.")
-        # keep mask as is
+        df = pd.read_csv(csv_path)
 
-df_filt = df.loc[mask].copy()
+    orig_cols = list(df.columns.astype(str))
+    norm_cols = _normalize_headers(orig_cols)
 
-# Show filtered table (non-editable, sortable)
-st.dataframe(df_filt, use_container_width=True, hide_index=True)
+    prot_span = {"protein","name","antigen","sequencename","seqname","proteina"}
+    start_syn = {"start","epitopestart","inicio","startpos","from"}
+    end_syn   = {"end","epitopeend","fin","endpos","to"}
+    prob_syn  = {"epitopeprobability","bepipredscore","score","prob","probability","bepipred2score"}
 
-# Download filtered CSV
-csv = df_filt.to_csv(index=False).encode("utf-8")
-st.download_button(
-    f"Download {name} filtered table (CSV)",
-    csv,
-    file_name=f"{name}_bepipred_table_filtered.csv",
-    mime="text/csv"
+    prot_res  = {"entry","protein","name","antigen","sequencename","seqname"}
+    pos_syn   = {"position","pos","residue","resid","resindex"}
+
+    # A) span schema
+    i_prot = _pick_column(norm_cols, prot_span)
+    i_start = _pick_column(norm_cols, start_syn)
+    i_end   = _pick_column(norm_cols, end_syn)
+    i_prob  = _pick_column(norm_cols, prob_syn)
+
+    if all(x is not None for x in (i_prot, i_start, i_end, i_prob)):
+        mapping = {
+            orig_cols[i_prot]:  "Protein",
+            orig_cols[i_start]: "Start",
+            orig_cols[i_end]:   "End",
+            orig_cols[i_prob]:  "EpitopeProbability",
+        }
+        span_df = df.rename(columns=mapping)[["Protein","Start","End","EpitopeProbability"]].copy()
+        span_df["Start"] = pd.to_numeric(span_df["Start"], errors="coerce")
+        span_df["End"] = pd.to_numeric(span_df["End"], errors="coerce")
+        span_df["EpitopeProbability"] = pd.to_numeric(span_df["EpitopeProbability"], errors="coerce")
+        span_df = span_df.dropna(subset=["Protein","Start","End","EpitopeProbability"])
+        swap = span_df["End"] < span_df["Start"]
+        if swap.any():
+            span_df.loc[swap, ["Start","End"]] = span_df.loc[swap, ["End","Start"]].values
+        return "span", span_df
+
+    # B) residue schema
+    i_entry = _pick_column(norm_cols, prot_res)
+    i_pos   = _pick_column(norm_cols, pos_syn)
+    i_prob2 = _pick_column(norm_cols, prob_syn)
+
+    if all(x is not None for x in (i_entry, i_pos, i_prob2)):
+        mapping = {
+            orig_cols[i_entry]: "Protein",
+            orig_cols[i_pos]:   "pos",
+            orig_cols[i_prob2]: "EpitopeProbability",
+        }
+        res_df = df.rename(columns=mapping)[["Protein","pos","EpitopeProbability"]].copy()
+        res_df["pos"] = pd.to_numeric(res_df["pos"], errors="coerce")
+        res_df["EpitopeProbability"] = pd.to_numeric(res_df["EpitopeProbability"], errors="coerce")
+        res_df = res_df.dropna(subset=["Protein","pos","EpitopeProbability"])
+        return "residue", res_df
+
+    st.error(
+        "Could not detect required columns in epitopes CSV.\n\n"
+        "Accepted span schema: Protein/Name/Antigen + Start + End + EpitopeProbability\n"
+        "Accepted residue schema: Entry/Protein/Name + Position + EpitopeProbability"
+    )
+    st.stop()
+
+# ---- Position selection helpers ---------------------------------------------
+def positions_above_threshold(schema: str, df: pd.DataFrame, protein: str, thr: float=0.5) -> list[int]:
+    if schema == "span":
+        sub = df[df["Protein"].astype(str).str.fullmatch(protein, case=False, na=False)]
+        if sub.empty:
+            tok = _norm_token(protein)
+            sub = df[_norm_series_tokens(df["Protein"]).str.contains(tok)]
+        sub = sub[sub["EpitopeProbability"] > thr]
+        pos = []
+        for _, r in sub.iterrows():
+            s, e = int(r["Start"]), int(r["End"])
+            pos.extend(range(min(s, e), max(s, e) + 1))
+        return sorted(set(pos))
+
+    # residue schema
+    sub = df[df["Protein"].astype(str).str.fullmatch(protein, case=False, na=False)]
+    if sub.empty:
+        tok = _norm_token(protein)
+        sub = df[_norm_series_tokens(df["Protein"]).str.contains(tok)]
+    sub = sub[sub["EpitopeProbability"] > thr]
+    return sorted(set(int(p) for p in sub["pos"].tolist()))
+
+def per_residue_profile(schema: str, df: pd.DataFrame, protein: str) -> pd.DataFrame:
+    """Return DataFrame with columns: pos, EpitopeProbability for selected protein."""
+    if schema == "residue":
+        sub = df[df["Protein"].astype(str).str.fullmatch(protein, case=False, na=False)]
+        if sub.empty:
+            tok = _norm_token(protein)
+            sub = df[_norm_series_tokens(df["Protein"]).str.contains(tok)]
+        prof = sub[["pos","EpitopeProbability"]].dropna().copy()
+        prof["pos"] = prof["pos"].astype(int)
+        return prof.sort_values("pos")
+
+    # expand span schema to per-residue profile
+    sub = df[df["Protein"].astype(str).str.fullmatch(protein, case=False, na=False)]
+    if sub.empty:
+        tok = _norm_token(protein)
+        sub = df[_norm_series_tokens(df["Protein"]).str.contains(tok)]
+    if sub.empty:
+        return pd.DataFrame(columns=["pos","EpitopeProbability"])
+    max_pos = int(sub[["Start","End"]].max().max())
+    vals = np.full(max_pos + 1, np.nan)
+    for _, r in sub.iterrows():
+        s, e, sc = int(r["Start"]), int(r["End"]), float(r["EpitopeProbability"])
+        s, e = min(s, e), max(s, e)
+        current = vals[s:e+1]
+        if np.isnan(current).all():
+            vals[s:e+1] = sc
+        else:
+            vals[s:e+1] = np.nanmax(np.vstack([current, np.full_like(current, sc)]), axis=0)
+    pos = np.arange(1, max_pos + 1)
+    return pd.DataFrame({"pos": pos, "EpitopeProbability": vals[1:]})
+
+# ---- Robust 3D renderer ------------------------------------------------------
+def render_structure(protein: str, highlight_positions: list[int], *, base_color="#87aade"):
+    """
+    Robust 3D viewer:
+    - Loads mmCIF/PDB
+    - Tries label→auth mapping for coloring; if anything fails, falls back to simple 'resi' selection
+    """
+    path = find_structure_for(protein)
+    if not path or not path.exists():
+        st.warning(f"No structure file was found for **{protein}** in `{STRUCT_DIR}`.")
+        return
+
+    try:
+        model_str = path.read_text(errors="ignore")
+    except Exception as e:
+        st.error(f"Could not read structure file: {e}")
+        return
+
+    fmt = "mmCIF" if path.suffix.lower() in (".cif", ".mmcif") else "pdb"
+
+    view = py3Dmol.view(width=900, height=600)
+    view.setBackgroundColor("white")
+    try:
+        view.addModel(model_str, fmt)
+    except Exception:
+        # Some builds accept 'cif' instead of 'mmCIF'
+        alt_fmt = "cif" if fmt == "mmCIF" else fmt
+        view.addModel(model_str, alt_fmt)
+
+    # robust coloring with mapping (fallback on error)
+    _color_with_label_to_auth(view, path, highlight_positions, base_color=base_color)
+
+    view.zoomTo()
+    st.caption(f"Using structure file: `{path.relative_to(STRUCT_DIR)}`")
+    components.html(view._make_html(), height=620, scrolling=False)
+
+# ==============================================================================
+# UI
+# ==============================================================================
+st.title("BepiPred-2.0 — Epitope Coloring from CSV")
+
+# Load CSV (supports residue/ span schemas)
+schema, epi_df = load_epitopes_csv(CSV_PATH)
+
+# Protein selector
+proteins = sorted(epi_df["Protein"].dropna().astype(str).unique(), key=str.lower)
+protein = st.selectbox("Protein", proteins, index=0)
+
+THRESHOLD = 0.5
+
+# ---- 1) DATA TABLE -----------------------------------------------------------
+st.subheader("Data table")
+if schema == "residue":
+    tbl = epi_df[epi_df["Protein"].astype(str).str.fullmatch(protein, case=False, na=False)]
+    if tbl.empty:
+        tok = _norm_token(protein)
+        tbl = epi_df[_norm_series_tokens(epi_df["Protein"]).str.contains(tok)]
+    st.dataframe(
+        tbl.sort_values("pos")[["Protein","pos","EpitopeProbability"]],
+        use_container_width=True, hide_index=True
+    )
+else:  # span
+    tbl = epi_df[epi_df["Protein"].astype(str).str.fullmatch(protein, case=False, na=False)]
+    if tbl.empty:
+        tok = _norm_token(protein)
+        tbl = epi_df[_norm_series_tokens(epi_df["Protein"]).str.contains(tok)]
+    st.dataframe(
+        tbl.sort_values(["Start","End"])[["Protein","Start","End","EpitopeProbability"]],
+        use_container_width=True, hide_index=True
+    )
+
+# ---- 2) CHART: EpitopeProbability vs Position --------------------------------
+st.subheader("EpitopeProbability vs Position")
+profile_df = per_residue_profile(schema, epi_df, protein).dropna()
+profile_df["Above"] = profile_df["EpitopeProbability"] > THRESHOLD
+
+chart_line = alt.Chart(profile_df).mark_line().encode(
+    x=alt.X("pos:Q", title="Position"),
+    y=alt.Y("EpitopeProbability:Q", title="EpitopeProbability", scale=alt.Scale(domain=[0, 1])),
+    tooltip=[alt.Tooltip("pos:Q", title="Pos"),
+             alt.Tooltip("EpitopeProbability:Q", title="Score", format=".3f")],
+).properties(height=300)
+
+chart_pts = alt.Chart(profile_df).mark_circle(size=36).encode(
+    x="pos:Q",
+    y="EpitopeProbability:Q",
+    color=alt.condition("datum.Above", alt.value("purple"), alt.value("#3465a4")),
+    tooltip=[alt.Tooltip("pos:Q", title="Pos"),
+             alt.Tooltip("EpitopeProbability:Q", title="Score", format=".3f")],
 )
 
-# ---------------- KPIs ----------------
-cols = st.columns(3)
-with cols[0]:
-    st.metric("Sequence length", f"{len(df)} aa")
-with cols[1]:
-    st.metric("Segments ≥ threshold", f"{len(segments)}")
-with cols[2]:
-    total_len = int((segments["end"] - segments["start"] + 1).sum()) if len(segments) else 0
-    st.metric("Total epitope length", f"{total_len} aa")
+rule = alt.Chart(pd.DataFrame({"y":[THRESHOLD]})).mark_rule(color="#999", strokeDash=[6,3]).encode(y="y:Q")
 
-# ---------------- Guide ----------------
-st.markdown(
-    """
-**What the charts show**
+st.altair_chart((chart_line + chart_pts + rule).interactive(), use_container_width=True)
 
-- **BepiPred scores**: per-residue scores (0–1). The dashed line is the threshold; orange bands mark contiguous segments above it (putative **linear B-cell epitopes**).
-- **Exposure track**: residues predicted as **Exposed** vs **Buried** (if present). Exposed segments are more likely to be antibody-accessible.
-- **RSA**: **Relative Solvent Accessibility** (0..1)—higher means more surface exposure.
-
-Tip: adjust the **threshold** to widen/narrow predicted epitopes and use the **Filters** above the table to subset residues of interest. Then export via **Download**.
-    """
-)
+# ---- 3) 3D STRUCTURE ---------------------------------------------------------
+st.subheader("Interactive 3D structure (cartoon, purple = > 0.5)")
+highlight = positions_above_threshold(schema, epi_df, protein, thr=THRESHOLD)
+render_structure(protein, highlight, base_color="#87aade")
